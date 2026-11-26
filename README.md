@@ -4,7 +4,9 @@ A 3D arcade game. Spin the tower, drop the ball through the gaps, and crash your
 
 ## Play
 
-Open `index.html` in a browser. It works straight from disk with no server or install needed (three.js is bundled in `vendor/`).
+**Play online: https://ty-robb.github.io/ball-crash/**
+
+Or open `index.html` in a browser. It works straight from disk with no server or install needed (three.js is bundled in `vendor/`).
 
 ## Controls
 
