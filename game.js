@@ -2,6 +2,9 @@
 (() => {
   'use strict';
 
+  // Treat colour codes as sRGB so on-screen colours match the hex values (r149 defaults to legacy mode).
+  if (THREE.ColorManagement) THREE.ColorManagement.legacyMode = false;
+
   // ---------- Tunables ----------
   const TAU = Math.PI * 2;
   const SEGMENTS = 12;
@@ -21,13 +24,16 @@
   const STEP = 1 / 120;        // physics timestep
   const DRAG_SPEED = 0.011;    // radians per pixel
   const KEY_SPEED = 3.4;       // radians per second
+  const STAGE_LEN = 50;        // endless: platforms per stage
+  const STARS_PER_LEVEL = 3;
+  const STAR_TOL = 0.36;       // radians either side of a star that still collects it
 
   const SAFE = 0, GAP = 1, HAZ = 2;
 
   const THEMES = [
     { bg: ['#1b1340', '#3b1f6b'], safe: 0x7c5cff, pole: 0xf1eaff, ball: 0xffd23f, fog: 0x2e1c5c },
     { bg: ['#05263b', '#0b5470'], safe: 0x19c3b5, pole: 0xe8fbff, ball: 0xfff275, fog: 0x0a3d57 },
-    { bg: ['#2a1a05', '#6b3d0b'], safe: 0xffa630, pole: 0xfff4e0, ball: 0x7df9ff, fog: 0x4d2c08 },
+    { bg: ['#2a1205', '#6b2f0b'], safe: 0x46b4ff, pole: 0xfff4e0, ball: 0xffffff, fog: 0x4d2408 },
     { bg: ['#0b2b12', '#1d6b34'], safe: 0x8ce36a, pole: 0xf0ffe8, ball: 0xff7ad9, fog: 0x154d24 },
     { bg: ['#2b0b2e', '#5e1a63'], safe: 0xff7ad9, pole: 0xfff0fd, ball: 0x8cf5ff, fog: 0x451548 },
     { bg: ['#101a2e', '#2a3f66'], safe: 0xdfe7f5, pole: 0x8fb3ff, ball: 0xffb347, fog: 0x1f2f4f },
@@ -37,10 +43,14 @@
   const $ = (id) => document.getElementById(id);
   const canvas = $('game');
   const ui = {
-    lvCur: $('lvCur'), lvNext: $('lvNext'), prog: $('prog'), score: $('score'), best: $('best'),
-    fire: $('fire'), fuel: $('fuel'), popups: $('popups'), mute: $('mute'),
-    overlay: $('overlay'), ovTitle: $('ovTitle'), ovText: $('ovText'), ovStats: $('ovStats'), ovBtn: $('ovBtn'),
+    hud: $('hud'), lvCur: $('lvCur'), lvNext: $('lvNext'), prog: $('prog'), barLabel: $('barLabel'),
+    score: $('score'), best: $('best'), hudStars: $('hudStars'), fire: $('fire'), fuel: $('fuel'),
+    popups: $('popups'), mute: $('mute'), homeBtn: $('homeBtn'), overlay: $('overlay'),
+    levelsSub: $('levelsSub'), endlessSub: $('endlessSub'), btnLevels: $('btnLevels'), btnEndless: $('btnEndless'),
+    grid: $('grid'), starTotal: $('starTotal'), levelsBack: $('levelsBack'),
+    rTitle: $('rTitle'), rStars: $('rStars'), rBig: $('rBig'), rText: $('rText'), rStats: $('rStats'), rButtons: $('rButtons'),
   };
+  const panels = { home: $('pHome'), levels: $('pLevels'), result: $('pResult') };
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem('ballcrash.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -79,6 +89,8 @@
     pole: new THREE.MeshStandardMaterial({ roughness: 0.5, metalness: 0.1 }),
     ball: new THREE.MeshStandardMaterial({ roughness: 0.22, metalness: 0.05, emissive: 0xff5a00, emissiveIntensity: 0 }),
     splat: new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }),
+    star: new THREE.MeshStandardMaterial({ color: 0xffd23f, emissive: 0xffb000, emissiveIntensity: 1.1, roughness: 0.3, metalness: 0.2 }),
+    halo: new THREE.MeshBasicMaterial({ color: 0xffe27a, transparent: true, opacity: 0.24, blending: THREE.AdditiveBlending, depthWrite: false }),
   };
 
   function makeSegmentGeometry() {
@@ -106,8 +118,22 @@
     return geo;
   }
 
+  function makeStarGeometry() {
+    const shape = new THREE.Shape();
+    for (let i = 0; i < 10; i++) {
+      const r = i % 2 ? 0.19 : 0.44, a = (i / 10) * TAU;
+      if (i) shape.lineTo(Math.sin(a) * r, Math.cos(a) * r);
+      else shape.moveTo(Math.sin(a) * r, Math.cos(a) * r);
+    }
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: 0.1, bevelEnabled: true, bevelThickness: 0.04, bevelSize: 0.04, bevelSegments: 1 });
+    geo.center();
+    return geo;
+  }
+
   const geos = {
     seg: makeSegmentGeometry(),
+    star: makeStarGeometry(),
+    halo: new THREE.SphereGeometry(0.56, 20, 14),
     spike: new THREE.ConeGeometry(0.17, 0.55, 8),
     ball: new THREE.SphereGeometry(BALL_R, 32, 20),
     splat: new THREE.CircleGeometry(1, 18).rotateX(-Math.PI / 2),
@@ -127,9 +153,18 @@
 
   // ---------- Game state ----------
   let state = 'menu';          // menu | play | dead | clear
-  let level = store.get('level', 1);
-  let best = store.get('best', 0);
+  let mode = 'levels';         // levels | endless
+  let unlocked = Math.max(1, store.get('level', 1));   // highest level you can play
+  let level = unlocked;        // level being played
+  const starsByLevel = store.get('stars', {});
+  let bestDepth = store.get('bestDepth', 0);
   let score = 0;
+  let starsGot = 0;
+  let depth = 0;               // endless: platforms passed
+  let stage = 1;               // endless: current stage
+  let newBest = false;
+  let genIndex = 0;            // endless: index of the next platform to generate
+  let runId = 0;               // bumps on every new run so stale timers do nothing
   let streak = 0;
   let fire = false;
   let fuel = 0;
@@ -144,8 +179,10 @@
   const splats = [];
   const debris = [];
 
-  // ---------- Level building ----------
   const rand = (n) => Math.floor(Math.random() * n);
+  const wrap = (a) => ((a % TAU) + TAU) % TAU;
+  const platformRot = (p) => p.baseRot + p.spin * time;
+  const totalStars = () => Object.values(starsByLevel).reduce((a, b) => a + b, 0);
 
   // ---------- Difficulty ----------
   // One smooth curve drives everything: 0 at level 1, ~0.5 at level 10, ~0.75 at level 20, then levels off.
@@ -163,7 +200,10 @@
       spinSpeed: 0.25 + d * 0.45,
     };
   }
+  // Endless stages step up like levels 2, 6, 10, 14, ... so each stage is a clear jump.
+  const endlessSettings = (s) => levelSettings(2 + (s - 1) * 4);
 
+  // ---------- Platform generation ----------
   // Segments of a new platform that sit directly under the gaps of the platform above it.
   // These never get hazards, so dropping through a gap can't land you straight on spikes.
   function segmentsUnderGaps(prev, rot) {
@@ -178,16 +218,16 @@
     return out;
   }
 
-  function genTypes(i, cfg, count, protect) {
+  function genTypes(i, cfg, ramp, protect, allowHaz) {
     const t = new Array(SEGMENTS).fill(SAFE);
     let gapSize = Math.random() < cfg.narrowGap ? 1 : 2;
     if (Math.random() < 0.12) gapSize = 3;              // occasional wide gap for combos
     const gapStart = i === 0 ? 3 + rand(6) : rand(SEGMENTS);
     for (let k = 0; k < gapSize; k++) t[(gapStart + k) % SEGMENTS] = GAP;
 
-    if (i >= 2) {
-      // Ease in over the level: 70% of the level's difficulty at the top, 100% near the bottom.
-      let x = cfg.hazards * (0.7 + 0.3 * i / count);
+    if (allowHaz) {
+      // Ease in: 70% of the difficulty at the top of a level/stage, 100% near the bottom.
+      let x = cfg.hazards * (0.7 + 0.3 * ramp);
       if (Math.random() < 0.12) x *= 0.4;               // the odd breather platform
       const open = [];
       for (let s = 0; s < SEGMENTS; s++) if (t[s] === SAFE && !protect.has(s)) open.push(s);
@@ -198,13 +238,12 @@
     return t;
   }
 
-  function makeSegment(type, finishIdx) {
+  function makeSegment(type, checkerIdx) {
     let mat = mats.safe;
     if (type === HAZ) mat = mats.haz;
-    if (finishIdx !== undefined) mat = finishIdx % 2 ? mats.finishB : mats.finishA;
+    if (checkerIdx !== undefined) mat = checkerIdx % 2 ? mats.finishB : mats.finishA;
     const m = new THREE.Mesh(geos.seg, mat);
     m.receiveShadow = true;
-    m.castShadow = false;
     if (type === HAZ) {
       for (const r of [1.45, 2.05, 2.65]) {
         const s = new THREE.Mesh(geos.spike, mats.spike);
@@ -215,38 +254,94 @@
     return m;
   }
 
-  function addPlatform(y, types, baseRot, spin, finish) {
+  function addPlatform(y, types, baseRot, spin, opts = {}) {
     const group = new THREE.Group();
     group.position.y = y;
     group.rotation.y = baseRot;
     for (let s = 0; s < SEGMENTS; s++) {
       if (types[s] === GAP) continue;
-      const m = makeSegment(types[s], finish ? s : undefined);
+      const m = makeSegment(types[s], opts.checker ? s : undefined);
       m.rotation.y = s * SEG_A;
       m.userData.seg = s;
       group.add(m);
     }
     tower.add(group);
-    platforms.push({ y, types, baseRot, spin, finish, group, smashed: false });
+    const p = { y, types, baseRot, spin, finish: !!opts.finish, group, smashed: false, star: null };
+    platforms.push(p);
+    return p;
   }
 
-  function applyTheme() {
-    theme = THEMES[(level - 1) % THEMES.length];
-    document.documentElement.style.setProperty('--bg-top', theme.bg[0]);
-    document.documentElement.style.setProperty('--bg-bot', theme.bg[1]);
-    document.documentElement.style.setProperty('--accent', '#' + new THREE.Color(theme.ball).getHexString());
-    mats.safe.color.setHex(theme.safe);
-    mats.pole.color.setHex(theme.pole);
-    mats.finishB.color.setHex(theme.ball);
-    mats.finishB.emissive.setHex(theme.ball);
-    ballColor.setHex(theme.ball);
-    mats.ball.color.copy(ballColor);
-    mats.splat.color.setHex(theme.ball);
-    scene.fog.color.setHex(theme.fog);
+  function makeNextPlatform(i, cfg, ramp, allowHaz, checker) {
+    const prev = platforms.length ? platforms[platforms.length - 1] : null;
+    const spin = allowHaz && Math.random() < cfg.spin
+      ? (Math.random() < 0.5 ? -1 : 1) * cfg.spinSpeed * (0.8 + Math.random() * 0.4) : 0;
+    const rot = i === 0 ? 0 : Math.random() * TAU;
+    const protect = spin ? new Set() : segmentsUnderGaps(prev, rot);
+    return addPlatform(-i * SPACING, genTypes(i, cfg, ramp, protect, allowHaz), rot, spin, { checker });
   }
 
-  function clearLevel() {
+  // A star floats in the middle of the platform's gap.
+  function addStar(p) {
+    let sx = 0, cz = 0;
+    p.types.forEach((t, s) => {
+      if (t !== GAP) return;
+      const a = (s + 0.5) * SEG_A;
+      sx += Math.sin(a);
+      cz += Math.cos(a);
+    });
+    const angle = wrap(Math.atan2(sx, cz));
+    const mesh = new THREE.Mesh(geos.star, mats.star);
+    mesh.add(new THREE.Mesh(geos.halo, mats.halo));
+    mesh.position.set(Math.sin(angle) * BALL_Z, PLAT_H / 2 + 0.6, Math.cos(angle) * BALL_Z);
+    p.group.add(mesh);
+    p.star = { angle, mesh };
+  }
+
+  // Endless: keep platforms generated ahead of the ball and drop the ones far above it.
+  function endlessFill() {
+    while (!platforms.length || platforms[platforms.length - 1].y > camY - 60) {
+      const i = genIndex++;
+      const s = Math.floor(i / STAGE_LEN) + 1;
+      const stageStart = i > 0 && i % STAGE_LEN === 0;   // checkered ring, no hazards: welcome to the next stage
+      makeNextPlatform(i, endlessSettings(s), (i % STAGE_LEN) / STAGE_LEN, i >= 2 && !stageStart, stageStart);
+    }
+    while (nextIdx > 0 && platforms[0].y > camY + 16) {
+      const p = platforms.shift();
+      nextIdx--;
+      tower.remove(p.group);
+    }
+  }
+
+  // ---------- Themes ----------
+  const themeTarget = { safe: new THREE.Color(), pole: new THREE.Color(), ball: new THREE.Color(), fog: new THREE.Color() };
+
+  function applyTheme(idx, instant) {
+    theme = THEMES[idx % THEMES.length];
+    const root = document.documentElement.style;
+    root.setProperty('--bg-top', theme.bg[0]);
+    root.setProperty('--bg-bot', theme.bg[1]);
+    root.setProperty('--accent', '#' + new THREE.Color(theme.ball).getHexString());
+    themeTarget.safe.setHex(theme.safe);
+    themeTarget.pole.setHex(theme.pole);
+    themeTarget.ball.setHex(theme.ball);
+    themeTarget.fog.setHex(theme.fog);
+    if (instant) blendTheme(1);
+  }
+
+  function blendTheme(k) {
+    mats.safe.color.lerp(themeTarget.safe, k);
+    mats.pole.color.lerp(themeTarget.pole, k);
+    ballColor.lerp(themeTarget.ball, k);
+    mats.finishB.color.copy(ballColor);
+    mats.finishB.emissive.copy(ballColor);
+    mats.splat.color.copy(ballColor);
+    scene.fog.color.lerp(themeTarget.fog, k);
+  }
+
+  // ---------- Building a run ----------
+  function clearTower() {
     while (tower.children.length) tower.remove(tower.children[0]);
+    if (pole) pole.geometry.dispose();
     for (const d of debris) scene.remove(d.obj);
     debris.length = 0;
     splats.length = 0;
@@ -254,66 +349,73 @@
     ui.popups.innerHTML = '';
   }
 
-  function buildLevel() {
-    clearLevel();
-    applyTheme();
-    const cfg = levelSettings(level);
-    const count = cfg.platforms;
-    let prev = null;
-    for (let i = 0; i < count; i++) {
-      const spin = i > 1 && Math.random() < cfg.spin
-        ? (Math.random() < 0.5 ? -1 : 1) * cfg.spinSpeed * (0.8 + Math.random() * 0.4) : 0;
-      const rot = i === 0 ? 0 : Math.random() * TAU;
-      const protect = spin ? new Set() : segmentsUnderGaps(prev, rot);
-      addPlatform(-i * SPACING, genTypes(i, cfg, count, protect), rot, spin, false);
-      prev = platforms[platforms.length - 1];
-    }
-    addPlatform(-count * SPACING, new Array(SEGMENTS).fill(SAFE), 0, 0, true);
-
-    const height = count * SPACING + 14;
-    pole = new THREE.Mesh(new THREE.CylinderGeometry(R_IN + 0.02, R_IN + 0.02, height, 40), mats.pole);
-    pole.position.y = -count * SPACING / 2 + 3;
-    pole.receiveShadow = true;
-    tower.add(pole);
-
+  function build() {
+    runId++;
+    clearTower();
     towerRot = 0;
     nextIdx = 0;
     streak = 0;
+    score = 0;
+    starsGot = 0;
+    depth = 0;
+    stage = 1;
+    genIndex = 0;
+    newBest = false;
+    camY = 0;
+    time = 0;
     setFire(false);
     ball.y = PLAT_H / 2 + BALL_R + 2.2;
     ball.vy = 0;
     ball.visible = true;
     ballMesh.visible = true;
-    camY = 0;
-    time = 0;
-    ui.lvCur.textContent = level;
-    ui.lvNext.textContent = level + 1;
-    updateHud();
+
+    if (mode === 'levels') {
+      applyTheme(level - 1, true);
+      const cfg = levelSettings(level);
+      const count = cfg.platforms;
+      const starAt = new Set([0.25, 0.55, 0.85].map((f) => Math.max(2, Math.round(count * f))));
+      for (let i = 0; i < count; i++) {
+        const p = makeNextPlatform(i, cfg, i / count, i >= 2, false);
+        if (starAt.has(i)) addStar(p);
+      }
+      addPlatform(-count * SPACING, new Array(SEGMENTS).fill(SAFE), 0, 0, { finish: true, checker: true });
+      const height = count * SPACING + 14;
+      pole = new THREE.Mesh(new THREE.CylinderGeometry(R_IN + 0.02, R_IN + 0.02, height, 40), mats.pole);
+      pole.position.y = -count * SPACING / 2 + 3;
+    } else {
+      applyTheme(0, true);
+      pole = new THREE.Mesh(new THREE.CylinderGeometry(R_IN + 0.02, R_IN + 0.02, 140, 40), mats.pole);
+      endlessFill();
+    }
+    pole.receiveShadow = true;
+    tower.add(pole);
+    updateHud(true);
   }
 
   // ---------- Collision helpers ----------
-  const wrap = (a) => ((a % TAU) + TAU) % TAU;
-  const platformRot = (p) => p.baseRot + p.spin * time;
-
-  function segmentUnderBall(p) {
+  function ballLocalAngle(p) {
     // Ball sits at world angle 0; convert to the platform's local angle.
-    const local = wrap(-(towerRot + platformRot(p)));
-    return Math.min(SEGMENTS - 1, Math.floor(local / SEG_A));
+    return wrap(-(towerRot + platformRot(p)));
   }
+  const segmentUnderBall = (p) => Math.min(SEGMENTS - 1, Math.floor(ballLocalAngle(p) / SEG_A));
 
   // ---------- Effects ----------
   const _v = new THREE.Vector3();
-  const _q = new THREE.Quaternion();
 
-  function popup(text, cls) {
-    _v.set(0, ball.y + 0.6, BALL_Z).project(camera);
+  function popup(text, cls, centered) {
     const el = document.createElement('div');
     el.className = 'pop' + (cls ? ' ' + cls : '');
     el.textContent = text;
-    el.style.left = ((_v.x + 1) / 2 * innerWidth + (Math.random() * 40 - 20)) + 'px';
-    el.style.top = ((1 - _v.y) / 2 * innerHeight) + 'px';
+    if (centered) {
+      el.style.left = '50%';
+      el.style.top = '38%';
+    } else {
+      _v.set(0, ball.y + 0.6, BALL_Z).project(camera);
+      el.style.left = ((_v.x + 1) / 2 * innerWidth + (Math.random() * 40 - 20)) + 'px';
+      el.style.top = ((1 - _v.y) / 2 * innerHeight) + 'px';
+    }
     ui.popups.appendChild(el);
-    setTimeout(() => el.remove(), 850);
+    setTimeout(() => el.remove(), centered ? 1700 : 850);
   }
 
   function addDebris(obj, vel, spin, life, gravity = 20, fadeMats = null, shrink = false) {
@@ -333,7 +435,7 @@
   }
 
   function addSplat(p) {
-    const local = wrap(-(towerRot + platformRot(p)));
+    const local = ballLocalAngle(p);
     const m = new THREE.Mesh(geos.splat, mats.splat);
     const s = 0.3 + Math.random() * 0.12;
     m.scale.set(s, 1, s * (0.8 + Math.random() * 0.4));
@@ -352,9 +454,8 @@
     const rot = towerRot + platformRot(p);
     tower.rotation.y = towerRot;          // sync transforms so pieces detach in place
     p.group.rotation.y = platformRot(p);
-    const parts = p.group.children.slice();
-    for (const m of parts) {
-      if (m.userData.seg === undefined) { p.group.remove(m); continue; } // splats
+    for (const m of p.group.children.slice()) {
+      if (m.userData.seg === undefined) { p.group.remove(m); continue; } // splats, stars
       const mid = m.userData.seg * SEG_A + SEG_A / 2 + rot;
       scene.attach(m);
       const speed = 4 + Math.random() * 4;
@@ -447,6 +548,7 @@
     fire: () => { tone(220, 0.45, 'sawtooth', 0.08, 880); noise(0.4, 0.15, 2500); },
     smash: () => { noise(0.3, 0.45, 1400); tone(170, 0.22, 'square', 0.1, 55); },
     die: () => { noise(0.45, 0.4, 700); tone(330, 0.6, 'sawtooth', 0.14, 45); },
+    star: () => { tone(1320, 0.12, 'sine', 0.16); tone(1760, 0.2, 'sine', 0.14, null, 0.07); },
     clear: () => [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.22, 'triangle', 0.18, null, i * 0.09)),
   };
   function setMuted(m) {
@@ -463,37 +565,60 @@
     ui.fire.classList.toggle('hidden', !on);
   }
 
-  function addScore(n) {
-    score += n;
-    if (score > best) { best = score; store.set('best', best); }
-    updateHud();
+  function collectStar(p) {
+    p.group.remove(p.star.mesh);
+    p.star = null;
+    starsGot++;
+    burst(geos.chip, [0xffd23f, 0xffffff, 0xffa000], 16, ball.y, 4.5, 0.7, true);
+    sfx.star();
+    popup('★', 'star');
   }
 
-  function passPlatform() {
+  function checkStar(p) {
+    if (!p.star) return;
+    let d = Math.abs(ballLocalAngle(p) - p.star.angle);
+    d = Math.min(d, TAU - d);
+    if (d <= STAR_TOL) collectStar(p);
+  }
+
+  function advanceDepth() {
+    depth++;
+    const s = Math.floor(depth / STAGE_LEN) + 1;
+    if (s !== stage) {
+      stage = s;
+      applyTheme(stage - 1, false);
+      popup('STAGE ' + stage, 'stage', true);
+      sfx.clear();
+    }
+  }
+
+  function passPlatform(p) {
     streak++;
+    checkStar(p);
     const pts = 10 * streak;
-    addScore(pts);
+    if (mode === 'endless') advanceDepth(); else score += pts;
     sfx.pass(streak);
     if (fire) {
       fuel = Math.min(FIRE_TIME, fuel + FIRE_REFILL);
-      popup('+' + pts, 'big');
+      if (mode === 'levels') popup('+' + pts, 'big');
     } else if (streak >= FIRE_STREAK) {
       setFire(true);
       sfx.fire();
       popup('FIREBALL!', 'big');
-    } else {
+    } else if (mode === 'levels') {
       popup('+' + pts, streak > 1 ? 'gold' : '');
     }
   }
 
   function smash(p) {
+    if (p.star) collectStar(p);             // crashing through a platform grabs its star too
     smashPlatform(p);
     streak++;
-    addScore(25);
+    if (mode === 'endless') advanceDepth(); else score += 25;
     ball.vy *= 0.5;
     shake = Math.max(shake, 0.35);
     sfx.smash();
-    popup('CRASH +25', 'big');
+    popup(mode === 'levels' ? 'CRASH +25' : 'CRASH!', 'big');
   }
 
   function bounce(p) {
@@ -508,12 +633,19 @@
 
   function die() {
     state = 'dead';
+    setFire(false);
     ball.visible = false;
     ballMesh.visible = false;
     burst(geos.chip, theme.ball, 22, ball.y, 6, 0.9, false);
     shake = 0.6;
     sfx.die();
-    setTimeout(() => showOverlay('dead'), 900);
+    if (mode === 'endless' && depth > bestDepth) {
+      bestDepth = depth;
+      newBest = true;
+      store.set('bestDepth', bestDepth);
+    }
+    const id = runId;
+    setTimeout(() => { if (id === runId) showResult('dead'); }, 900);
   }
 
   function finishLevel(p) {
@@ -522,13 +654,20 @@
     setFire(false);
     state = 'clear';
     const bonus = 50 * level;
-    addScore(bonus);
+    score += bonus;
     popup('LEVEL CLEAR +' + bonus, 'gold');
     burst(geos.confetti, [0xffffff, theme.ball, theme.safe, 0xff5f8f], 50, ball.y + 0.2, 7, 1.6, false);
     sfx.clear();
-    level++;
-    store.set('level', level);
-    setTimeout(() => showOverlay('clear'), 900);
+    if (starsGot > (starsByLevel[level] || 0)) {
+      starsByLevel[level] = starsGot;
+      store.set('stars', starsByLevel);
+    }
+    if (level + 1 > unlocked) {
+      unlocked = level + 1;
+      store.set('level', unlocked);
+    }
+    const id = runId;
+    setTimeout(() => { if (id === runId) showResult('clear'); }, 900);
   }
 
   // ---------- Physics ----------
@@ -548,10 +687,10 @@
       if (ball.y - BALL_R > top) break;
 
       if (p.finish) { finishLevel(p); break; }
-      if (state !== 'play') { bounce(p); break; }   // menu: just bounce on the first platform
+      if (state !== 'play') { bounce(p); break; }   // menu backdrop: just bounce
 
       const type = p.types[segmentUnderBall(p)];
-      if (type === GAP) { nextIdx++; passPlatform(); continue; }
+      if (type === GAP) { nextIdx++; passPlatform(p); continue; }
       if (fire) { nextIdx++; smash(p); continue; }
       if (type === HAZ) { die(); return; }
       bounce(p);
@@ -559,43 +698,156 @@
     }
   }
 
-  // ---------- HUD / overlay ----------
-  function updateHud() {
-    ui.score.textContent = score;
-    ui.best.textContent = 'BEST ' + best;
-    const total = Math.max(1, platforms.length - 1);
-    ui.prog.style.width = Math.min(100, (nextIdx / total) * 100) + '%';
+  // ---------- HUD ----------
+  const starRow = (n, of = STARS_PER_LEVEL) => {
+    let s = '';
+    for (let i = 0; i < of; i++) s += `<span class="st${i < n ? ' on' : ''}">★</span>`;
+    return s;
+  };
+
+  const hudCache = {};
+  function setText(el, key, value, html) {
+    if (hudCache[key] === value) return;
+    hudCache[key] = value;
+    if (html) el.innerHTML = value; else el.textContent = value;
   }
 
-  function showOverlay(kind) {
-    if (kind === 'dead') {
-      ui.ovTitle.innerHTML = '<span class="crash">CRASHED</span>';
-      ui.ovText.textContent = 'You hit a hazard on level ' + level + '.';
-      ui.ovStats.textContent = 'Score ' + score + '  ·  Best ' + best;
-      ui.ovBtn.textContent = 'RETRY';
-    } else if (kind === 'clear') {
-      ui.ovTitle.innerHTML = 'LEVEL<br><span class="crash">CLEARED</span>';
-      ui.ovText.textContent = 'Next up: level ' + level + '.';
-      ui.ovStats.textContent = 'Score ' + score + '  ·  Best ' + best;
-      ui.ovBtn.textContent = 'NEXT';
+  function updateHud(force) {
+    if (force) for (const k in hudCache) delete hudCache[k];
+    if (mode === 'levels') {
+      setText(ui.lvCur, 'cur', level);
+      setText(ui.lvNext, 'next', level + 1);
+      setText(ui.barLabel, 'label', '');
+      setText(ui.score, 'score', score);
+      setText(ui.best, 'best', '');
+      setText(ui.hudStars, 'stars', starRow(starsGot), true);
+      ui.prog.style.width = Math.min(100, (nextIdx / Math.max(1, platforms.length - 1)) * 100) + '%';
+    } else {
+      setText(ui.lvCur, 'cur', stage);
+      setText(ui.lvNext, 'next', stage + 1);
+      setText(ui.barLabel, 'label', 'STAGE ' + stage + '  ·  ' + (STAGE_LEN - (depth % STAGE_LEN)) + ' TO NEXT');
+      setText(ui.score, 'score', depth);
+      setText(ui.best, 'best', 'BEST ' + Math.max(bestDepth, depth));
+      setText(ui.hudStars, 'stars', '', true);
+      ui.prog.style.width = ((depth % STAGE_LEN) / STAGE_LEN) * 100 + '%';
     }
-    ui.overlay.dataset.kind = kind;
+  }
+
+  function setHudVisible(on) {
+    ui.hud.classList.toggle('off', !on);
+    ui.homeBtn.classList.toggle('off', !on);
+  }
+
+  // ---------- Screens ----------
+  let primaryAction = null;
+
+  function showPanel(name) {
+    for (const [k, el] of Object.entries(panels)) el.classList.toggle('hidden', k !== name);
+    ui.overlay.dataset.panel = name;
     ui.overlay.classList.remove('hidden');
   }
 
-  function onOverlayAction() {
-    ensureAudio();
-    const kind = ui.overlay.dataset.kind || 'menu';
-    if (kind === 'dead') score = 0;
-    if (kind !== 'menu') buildLevel();
-    ui.overlay.classList.add('hidden');
-    state = 'play';
-    updateHud();
+  function goHome() {
+    mode = 'levels';
+    level = unlocked;
+    build();
+    state = 'menu';
+    setHudVisible(false);
+    const stars = totalStars();
+    ui.levelsSub.textContent = 'Level ' + unlocked + (stars ? '  ·  ★ ' + stars : '');
+    ui.endlessSub.textContent = bestDepth ? 'Best depth ' + bestDepth : 'How deep can you go?';
+    primaryAction = () => startLevel(unlocked);
+    showPanel('home');
   }
 
-  ui.ovBtn.addEventListener('click', (e) => { e.stopPropagation(); onOverlayAction(); });
-  ui.overlay.addEventListener('click', onOverlayAction);
-  ui.mute.addEventListener('click', (e) => { e.stopPropagation(); ensureAudio(); setMuted(!muted); });
+  function openLevels() {
+    const shown = Math.max(20, Math.ceil((unlocked + 1) / 10) * 10);
+    ui.grid.innerHTML = '';
+    let current = null;
+    for (let n = 1; n <= shown; n++) {
+      const tile = document.createElement('button');
+      const locked = n > unlocked;
+      tile.className = 'tile' + (locked ? ' locked' : '') + (n === unlocked ? ' next' : '');
+      tile.innerHTML = locked
+        ? `<span class="n">🔒</span><span class="ts">${n}</span>`
+        : `<span class="n">${n}</span><span class="ts">${starRow(starsByLevel[n] || 0)}</span>`;
+      if (!locked) tile.addEventListener('click', () => startLevel(n));
+      else tile.disabled = true;
+      if (n === unlocked) current = tile;
+      ui.grid.appendChild(tile);
+    }
+    ui.starTotal.textContent = '★ ' + totalStars();
+    primaryAction = () => startLevel(unlocked);
+    showPanel('levels');
+    if (current) current.scrollIntoView({ block: 'center' });
+  }
+
+  function startRun(newMode, n) {
+    ensureAudio();
+    mode = newMode;
+    if (n) level = n;
+    build();
+    state = 'play';
+    ui.overlay.classList.add('hidden');
+    setHudVisible(true);
+  }
+  const startLevel = (n) => startRun('levels', n);
+  const startEndless = () => startRun('endless');
+
+  function setButtons(list) {
+    ui.rButtons.innerHTML = '';
+    list.forEach((b, i) => {
+      const el = document.createElement('button');
+      el.className = 'btn ' + (i === 0 ? 'primary' : 'ghost');
+      el.textContent = b.label;
+      el.addEventListener('click', () => { ensureAudio(); b.fn(); });
+      ui.rButtons.appendChild(el);
+      if (i === 0) ui.rButtons.appendChild(Object.assign(document.createElement('div'), { className: 'row-break' }));
+    });
+    primaryAction = list[0].fn;
+  }
+
+  function showResult(kind) {
+    ui.rStars.innerHTML = '';
+    ui.rBig.textContent = '';
+    ui.rStats.className = '';
+    if (kind === 'dead' && mode === 'endless') {
+      ui.rTitle.innerHTML = '<span class="crash">CRASHED</span>';
+      ui.rBig.textContent = depth;
+      ui.rText.textContent = 'platforms deep  ·  stage ' + stage;
+      ui.rStats.textContent = newBest ? 'NEW BEST!' : 'Best ' + bestDepth;
+      if (newBest) ui.rStats.className = 'newbest';
+      setButtons([{ label: 'RETRY', fn: startEndless }, { label: 'HOME', fn: goHome }]);
+    } else if (kind === 'dead') {
+      ui.rTitle.innerHTML = '<span class="crash">CRASHED</span>';
+      ui.rText.textContent = 'Reach the bottom of level ' + level + ' without crashing to pass it.';
+      ui.rStats.textContent = '';
+      setButtons([
+        { label: 'RETRY', fn: () => startLevel(level) },
+        { label: 'LEVELS', fn: openLevels },
+        { label: 'HOME', fn: goHome },
+      ]);
+    } else {
+      ui.rTitle.innerHTML = 'LEVEL ' + level + '<br><span class="crash">CLEARED</span>';
+      ui.rStars.innerHTML = starRow(starsGot);
+      ui.rText.textContent = starsGot === STARS_PER_LEVEL
+        ? 'Perfect! You got every star.'
+        : 'Grab all ' + STARS_PER_LEVEL + ' stars for a perfect clear. Fireball smashes collect them too.';
+      ui.rStats.textContent = 'Score ' + score;
+      setButtons([
+        { label: 'NEXT', fn: () => startLevel(level + 1) },
+        { label: 'RETRY', fn: () => startLevel(level) },
+        { label: 'LEVELS', fn: openLevels },
+      ]);
+    }
+    showPanel('result');
+  }
+
+  ui.btnLevels.addEventListener('click', () => { ensureAudio(); openLevels(); });
+  ui.btnEndless.addEventListener('click', () => startEndless());
+  ui.levelsBack.addEventListener('click', () => goHome());
+  ui.homeBtn.addEventListener('click', () => goHome());
+  ui.mute.addEventListener('click', () => { ensureAudio(); setMuted(!muted); });
 
   // ---------- Input ----------
   const keys = new Set();
@@ -618,10 +870,13 @@
 
   addEventListener('keydown', (e) => {
     keys.add(e.code);
-    if ((e.code === 'Space' || e.code === 'Enter') && !ui.overlay.classList.contains('hidden')) {
+    const menuOpen = !ui.overlay.classList.contains('hidden');
+    if ((e.code === 'Space' || e.code === 'Enter') && menuOpen && primaryAction) {
       e.preventDefault();
-      onOverlayAction();
+      ensureAudio();
+      primaryAction();
     }
+    if (e.code === 'Escape' && (state === 'play' || ui.overlay.dataset.panel !== 'home')) goHome();
     if (e.code === 'KeyM') { ensureAudio(); setMuted(!muted); }
   });
   addEventListener('keyup', (e) => keys.delete(e.code));
@@ -654,6 +909,8 @@
     if (state === 'play') {
       if (keys.has('ArrowLeft') || keys.has('KeyA')) towerRot -= KEY_SPEED * dt;
       if (keys.has('ArrowRight') || keys.has('KeyD')) towerRot += KEY_SPEED * dt;
+    } else if (state === 'menu') {
+      towerRot += dt * 0.35;                      // slow showcase spin behind the menus
     }
 
     if (state !== 'dead') {
@@ -663,9 +920,21 @@
       time += dt;
     }
 
-    // Tower and spinning platforms
+    if (mode === 'endless') {
+      endlessFill();
+      pole.position.y = camY - 40;
+    }
+    blendTheme(1 - Math.exp(-dt * 3));
+
+    // Tower, spinning platforms, stars
     tower.rotation.y = towerRot;
-    for (const p of platforms) if (p.spin && !p.smashed) p.group.rotation.y = platformRot(p);
+    for (const p of platforms) {
+      if (p.spin && !p.smashed) p.group.rotation.y = platformRot(p);
+      if (p.star) {
+        p.star.mesh.rotation.y = time * 3;
+        p.star.mesh.position.y = PLAT_H / 2 + 0.6 + Math.sin(time * 4) * 0.08;
+      }
+    }
 
     // Ball visuals
     ball.squash = Math.max(0, ball.squash - dt * 7);
@@ -720,16 +989,22 @@
   // ---------- Debug hook (only with ?debug in the URL) ----------
   if (/[?&]debug\b/.test(location.search)) {
     window.ballCrash = {
-      get state() { return { state, level, score, streak, fire, fuel, nextIdx, total: platforms.length, ballY: ball.y, towerRot }; },
+      get state() {
+        return { state, mode, level, unlocked, score, starsGot, depth, stage, streak, fire, fuel, nextIdx,
+          total: platforms.length, ballY: ball.y, towerRot, panel: ui.overlay.dataset.panel };
+      },
       setRot(r) { towerRot = r; },
-      platform(i) { const p = platforms[i]; return p && { types: p.types, rot: platformRot(p), baseRot: p.baseRot, spin: p.spin, finish: p.finish, smashed: p.smashed }; },
-      setLevel(n) { level = n; buildLevel(); },
+      platform(i) {
+        const p = platforms[i];
+        return p && { types: p.types, rot: platformRot(p), baseRot: p.baseRot, spin: p.spin, finish: p.finish,
+          smashed: p.smashed, star: p.star ? p.star.angle : null };
+      },
+      settings: levelSettings,
+      startLevel, startEndless, goHome, openLevels,
     };
   }
 
   // ---------- Boot ----------
-  buildLevel();
-  ui.overlay.dataset.kind = 'menu';
-  if (level > 1) ui.ovStats.textContent = 'Continue from level ' + level;
+  goHome();
   requestAnimationFrame(frame);
 })();

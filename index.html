@@ -5,18 +5,21 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Ball Crash</title>
 <style>
-  :root { --bg-top: #1b1340; --bg-bot: #3b1f6b; --accent: #ffd23f; }
+  :root { --bg-top: #1b1340; --bg-bot: #3b1f6b; --accent: #ffd23f; --gold: #ffd23f; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     margin: 0; height: 100%; overflow: hidden; touch-action: none; user-select: none;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff;
     background: linear-gradient(180deg, var(--bg-top), var(--bg-bot));
-    transition: background 0.6s;
+    transition: background 1s;
   }
+  button { font: inherit; color: inherit; }
   canvas#game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
   canvas#game:active { cursor: grabbing; }
 
-  #hud { position: fixed; top: 0; left: 0; right: 0; padding: 16px; pointer-events: none; text-align: center; }
+  /* ---------- HUD ---------- */
+  #hud { position: fixed; top: 0; left: 0; right: 0; padding: 16px; pointer-events: none; text-align: center; transition: opacity 0.2s; }
+  #hud.off, #homeBtn.off { opacity: 0; pointer-events: none; }
   #levelbar { display: flex; align-items: center; justify-content: center; gap: 10px; }
   .lv {
     width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
@@ -25,8 +28,12 @@
   .lv.cur { background: var(--accent); color: #222; border-color: var(--accent); }
   .track { width: min(52vw, 260px); height: 12px; border-radius: 8px; background: rgba(255,255,255,0.18); overflow: hidden; }
   #prog { height: 100%; width: 0%; background: var(--accent); border-radius: 8px; transition: width 0.15s; }
-  #score { font-size: 52px; font-weight: 900; margin-top: 10px; text-shadow: 0 3px 0 rgba(0,0,0,0.25); line-height: 1; }
+  #barLabel { font-size: 12px; font-weight: 800; letter-spacing: 0.15em; opacity: 0.75; margin-top: 6px; min-height: 1em; }
+  #score { font-size: 52px; font-weight: 900; margin-top: 6px; text-shadow: 0 3px 0 rgba(0,0,0,0.25); line-height: 1; }
   #best { font-size: 13px; font-weight: 700; opacity: 0.7; letter-spacing: 0.12em; margin-top: 4px; }
+  #hudStars { font-size: 26px; letter-spacing: 4px; margin-top: 4px; }
+  .st { color: rgba(255,255,255,0.25); }
+  .st.on { color: var(--gold); text-shadow: 0 0 10px rgba(255,190,0,0.8); }
 
   #fire {
     margin: 12px auto 0; width: 170px; font-weight: 900; font-size: 15px; letter-spacing: 0.2em;
@@ -36,10 +43,12 @@
   .fuel { height: 6px; margin-top: 5px; border-radius: 4px; background: rgba(255,255,255,0.2); overflow: hidden; }
   #fuel { height: 100%; width: 100%; background: linear-gradient(90deg, #ff3d00, #ffd23f); }
 
-  #mute {
-    position: fixed; right: 12px; bottom: 12px; width: 44px; height: 44px; border-radius: 50%;
-    border: 0; background: rgba(255,255,255,0.18); color: #fff; font-size: 18px; cursor: pointer;
+  .round {
+    position: fixed; width: 44px; height: 44px; border-radius: 50%; border: 0;
+    background: rgba(255,255,255,0.18); color: #fff; font-size: 20px; cursor: pointer; transition: opacity 0.2s;
   }
+  #mute { right: 12px; bottom: 12px; font-size: 18px; }
+  #homeBtn { left: 12px; top: 12px; }
 
   #popups { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
   .pop {
@@ -48,55 +57,136 @@
   }
   .pop.big { font-size: 30px; color: #ffb347; text-shadow: 0 0 14px #ff5a00; }
   .pop.gold { color: var(--accent); }
+  .pop.star { font-size: 44px; color: var(--gold); text-shadow: 0 0 16px rgba(255,190,0,0.9); }
+  .pop.stage {
+    font-size: clamp(40px, 11vw, 72px); color: #fff; text-shadow: 0 0 24px var(--accent), 0 4px 0 rgba(0,0,0,0.3);
+    animation: stage 1.6s ease-out forwards;
+  }
   @keyframes rise { from { opacity: 1; margin-top: 0; } to { opacity: 0; margin-top: -70px; } }
+  @keyframes stage {
+    0% { opacity: 0; transform: translate(-50%, -50%) scale(0.6); }
+    15% { opacity: 1; transform: translate(-50%, -50%) scale(1.08); }
+    25% { transform: translate(-50%, -50%) scale(1); }
+    75% { opacity: 1; }
+    100% { opacity: 0; transform: translate(-50%, -70%) scale(1); }
+  }
 
+  /* ---------- Menus ---------- */
   #overlay {
     position: fixed; inset: 0; display: grid; place-items: center; background: rgba(10, 5, 30, 0.45);
     backdrop-filter: blur(3px); transition: opacity 0.25s;
   }
   #overlay.hidden { opacity: 0; pointer-events: none; }
-  .card { text-align: center; padding: 28px 32px; max-width: 90vw; }
-  .card h1 {
+  .panel { text-align: center; padding: 24px; width: min(440px, 94vw); max-height: 100vh; }
+  .panel.hidden { display: none; }
+  h1 {
     margin: 0; font-size: clamp(44px, 12vw, 84px); font-weight: 900; letter-spacing: 0.02em; line-height: 0.95;
     text-shadow: 0 5px 0 rgba(0,0,0,0.3);
   }
-  .card h1 .crash { color: var(--accent); }
-  .card p { opacity: 0.85; font-size: 16px; line-height: 1.5; margin: 16px 0 6px; }
-  #ovStats { font-size: 20px; font-weight: 800; margin: 10px 0; min-height: 1em; }
-  #ovBtn {
-    margin-top: 14px; padding: 15px 46px; border: 0; border-radius: 40px; font: inherit; font-size: 20px;
-    font-weight: 900; letter-spacing: 0.1em; background: var(--accent); color: #222; cursor: pointer;
+  h1 .crash { color: var(--accent); }
+  .tag { opacity: 0.85; font-size: 16px; margin: 14px 0 22px; }
+
+  .modes { display: grid; gap: 14px; }
+  .mode {
+    display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 16px 20px; border: 0; border-radius: 22px;
+    cursor: pointer; box-shadow: 0 5px 0 rgba(0,0,0,0.25); transition: transform 0.1s;
+  }
+  .mode:active { transform: translateY(3px); box-shadow: 0 2px 0 rgba(0,0,0,0.25); }
+  .mode.levels { background: var(--accent); color: #222; }
+  .mode.endless { background: linear-gradient(90deg, #ff3d00, #ff9a3d); color: #fff; }
+  .mname { font-size: 24px; font-weight: 900; letter-spacing: 0.12em; }
+  .msub { font-size: 14px; font-weight: 700; opacity: 0.8; }
+  .how { font-size: 14px; opacity: 0.75; line-height: 1.55; margin-top: 22px; }
+  .keys { font-size: 12px; opacity: 0.55; margin-top: 10px; }
+
+  .phead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .phead h2 { margin: 0; font-size: 28px; font-weight: 900; letter-spacing: 0.1em; }
+  .back { width: 44px; height: 44px; border-radius: 50%; border: 0; background: rgba(255,255,255,0.18); font-size: 24px; cursor: pointer; }
+  #starTotal { font-weight: 900; font-size: 18px; color: var(--gold); min-width: 44px; text-align: right; }
+  #grid {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; max-height: min(62vh, 520px); overflow-y: auto;
+    padding: 4px 4px 12px; touch-action: pan-y;
+  }
+  .tile {
+    aspect-ratio: 1; border: 0; border-radius: 16px; background: rgba(255,255,255,0.16); cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  }
+  .tile .n { font-size: 20px; font-weight: 900; }
+  .tile .ts { font-size: 11px; letter-spacing: 1px; }
+  .tile.next { background: var(--accent); color: #222; box-shadow: 0 0 0 3px rgba(255,255,255,0.6); }
+  .tile.next .st { color: rgba(0,0,0,0.25); }
+  .tile.locked { opacity: 0.35; cursor: default; }
+
+  #rStars { font-size: 56px; letter-spacing: 8px; margin-top: 12px; min-height: 0; }
+  #rBig { font-size: 64px; font-weight: 900; line-height: 1; margin-top: 12px; }
+  #rText { opacity: 0.85; font-size: 16px; line-height: 1.5; margin: 12px 0 4px; }
+  #rStats { font-size: 18px; font-weight: 800; margin: 6px 0 4px; min-height: 1em; }
+  #rStats.newbest { color: var(--accent); }
+  #rButtons { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 16px; }
+  .btn { padding: 13px 26px; border: 0; border-radius: 40px; font-size: 16px; font-weight: 900; letter-spacing: 0.1em; cursor: pointer; }
+  .btn.primary {
+    flex-basis: 100%; max-width: 260px; padding: 15px 30px; font-size: 20px; background: var(--accent); color: #222;
     box-shadow: 0 5px 0 rgba(0,0,0,0.25); animation: pulse 1.4s ease-in-out infinite;
   }
-  @keyframes pulse { 50% { transform: scale(1.06); } }
-  .keys { font-size: 13px; opacity: 0.6; margin-top: 18px; }
+  .btn.ghost { background: rgba(255,255,255,0.18); }
+  .row-break { flex-basis: 100%; height: 0; }
+  @keyframes pulse { 50% { transform: scale(1.05); } }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
 
-<div id="hud">
+<div id="hud" class="off">
   <div id="levelbar">
     <span id="lvCur" class="lv cur">1</span>
     <div class="track"><div id="prog"></div></div>
     <span id="lvNext" class="lv">2</span>
   </div>
+  <div id="barLabel"></div>
   <div id="score">0</div>
-  <div id="best">BEST 0</div>
+  <div id="best"></div>
+  <div id="hudStars"></div>
   <div id="fire" class="hidden">FIREBALL<div class="fuel"><div id="fuel"></div></div></div>
 </div>
 
 <div id="popups"></div>
-<button id="mute" title="Toggle sound (M)">🔊</button>
+<button id="homeBtn" class="round off" title="Home (Esc)">⌂</button>
+<button id="mute" class="round" title="Toggle sound (M)">🔊</button>
 
 <div id="overlay">
-  <div class="card">
-    <h1 id="ovTitle">BALL<br><span class="crash">CRASH</span></h1>
-    <p id="ovText">Drag to spin the tower. Drop through the gaps.<br>Avoid the glowing red spikes.<br>3 gaps in a row without bouncing = <b>FIREBALL</b>.</p>
-    <div id="ovStats"></div>
-    <button id="ovBtn">PLAY</button>
-    <div class="keys">Mouse / touch drag &nbsp;·&nbsp; ← → or A D &nbsp;·&nbsp; M to mute</div>
-  </div>
+  <section id="pHome" class="panel">
+    <h1>BALL<br><span class="crash">CRASH</span></h1>
+    <p class="tag">Spin the tower. Drop through the gaps. Go fireball.</p>
+    <div class="modes">
+      <button class="mode levels" id="btnLevels"><span class="mname">LEVELS</span><span class="msub" id="levelsSub">Level 1</span></button>
+      <button class="mode endless" id="btnEndless"><span class="mname">ENDLESS</span><span class="msub" id="endlessSub">How deep can you go?</span></button>
+    </div>
+    <div class="how">
+      Avoid the glowing red spikes.<br>
+      3 gaps in a row without bouncing = <b>FIREBALL</b>, which smashes through anything.<br>
+      Levels: reach the bottom without crashing and grab the ★ stars.<br>
+      Endless: it gets harder every 50 platforms.
+    </div>
+    <div class="keys">Drag (mouse / touch) or ← → / A D to spin · Esc for home · M to mute</div>
+  </section>
+
+  <section id="pLevels" class="panel hidden">
+    <div class="phead">
+      <button class="back" id="levelsBack" title="Back">‹</button>
+      <h2>LEVELS</h2>
+      <span id="starTotal">★ 0</span>
+    </div>
+    <div id="grid"></div>
+  </section>
+
+  <section id="pResult" class="panel hidden">
+    <h1 id="rTitle"></h1>
+    <div id="rStars"></div>
+    <div id="rBig"></div>
+    <p id="rText"></p>
+    <div id="rStats"></div>
+    <div id="rButtons"></div>
+  </section>
 </div>
 
 <script src="vendor/three.min.js"></script>
