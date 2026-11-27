@@ -25,7 +25,7 @@ Or open `index.html` in a browser. It works straight from disk with no server or
 - Reach the checkered platform at the bottom to clear the level.
 - Points: each gap is worth 10 × your current streak, each smash is +25, and clearing a level gives +50 × the level number.
 
-Later levels add more platforms and hazards, narrower gaps, and platforms that spin on their own. Your level and best score are saved in the browser.
+Difficulty ramps up gradually. Each level adds one platform and a few more hazards. From level 6, some gaps get narrower and some platforms spin on their own. The platform right under a gap you just fell through never has spikes waiting for you. Your level and best score are saved in the browser.
 
 ## Files
 

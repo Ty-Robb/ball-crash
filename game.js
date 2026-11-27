@@ -147,22 +147,53 @@
   // ---------- Level building ----------
   const rand = (n) => Math.floor(Math.random() * n);
 
-  function genTypes(i, n) {
+  // ---------- Difficulty ----------
+  // One smooth curve drives everything: 0 at level 1, ~0.5 at level 10, ~0.75 at level 20, then levels off.
+  const difficulty = (n) => 1 - Math.exp(-(n - 1) / 14);
+  // Rounds x up or down at random so the average is exactly x (2.3 -> 2 most of the time, 3 sometimes).
+  const roundRandom = (x) => Math.floor(x) + (Math.random() < x - Math.floor(x) ? 1 : 0);
+
+  function levelSettings(n) {
+    const d = difficulty(n);
+    return {
+      platforms: Math.min(12 + n, 40),
+      hazards: 0.5 + d * 3.5,                         // average red segments per platform (out of 12)
+      narrowGap: n < 6 ? 0 : Math.min(0.35, d * 0.45), // chance a gap is only one segment wide
+      spin: n < 6 ? 0 : Math.min(0.3, d * 0.4),        // chance a platform spins on its own
+      spinSpeed: 0.25 + d * 0.45,
+    };
+  }
+
+  // Segments of a new platform that sit directly under the gaps of the platform above it.
+  // These never get hazards, so dropping through a gap can't land you straight on spikes.
+  function segmentsUnderGaps(prev, rot) {
+    const out = new Set();
+    if (!prev || prev.spin) return out;
+    prev.types.forEach((type, g) => {
+      if (type !== GAP) return;
+      for (const f of [0.02, 0.5, 0.98]) {
+        out.add(Math.floor(wrap((g + f) * SEG_A + prev.baseRot - rot) / SEG_A) % SEGMENTS);
+      }
+    });
+    return out;
+  }
+
+  function genTypes(i, cfg, count, protect) {
     const t = new Array(SEGMENTS).fill(SAFE);
-    let gapSize = n < 4 ? 2 : (Math.random() < 0.35 ? 1 : 2);
+    let gapSize = Math.random() < cfg.narrowGap ? 1 : 2;
     if (Math.random() < 0.12) gapSize = 3;              // occasional wide gap for combos
     const gapStart = i === 0 ? 3 + rand(6) : rand(SEGMENTS);
     for (let k = 0; k < gapSize; k++) t[(gapStart + k) % SEGMENTS] = GAP;
 
-    if (i > 0) {
-      const ramp = Math.min(1, i / 4);                  // first few platforms of a level are gentler
-      const count = Math.min(6, Math.floor((0.6 + n * 0.35 + Math.random() * 1.8) * ramp));
-      for (let h = 0, tries = 0; h < count && tries < 40; tries++) {
-        const s = rand(SEGMENTS);
-        if (t[s] === SAFE) { t[s] = HAZ; h++; }
+    if (i >= 2) {
+      // Ease in over the level: 70% of the level's difficulty at the top, 100% near the bottom.
+      let x = cfg.hazards * (0.7 + 0.3 * i / count);
+      if (Math.random() < 0.12) x *= 0.4;               // the odd breather platform
+      const open = [];
+      for (let s = 0; s < SEGMENTS; s++) if (t[s] === SAFE && !protect.has(s)) open.push(s);
+      for (let h = Math.min(6, roundRandom(x), open.length - 1); h > 0; h--) {
+        t[open.splice(rand(open.length), 1)[0]] = HAZ;
       }
-      // Always leave somewhere to land.
-      if (!t.includes(SAFE)) t[t.indexOf(HAZ)] = SAFE;
     }
     return t;
   }
@@ -226,11 +257,16 @@
   function buildLevel() {
     clearLevel();
     applyTheme();
-    const count = Math.min(12 + level * 2, 44);
+    const cfg = levelSettings(level);
+    const count = cfg.platforms;
+    let prev = null;
     for (let i = 0; i < count; i++) {
-      const spinChance = level >= 3 && i > 1 ? Math.min(0.35, (level - 2) * 0.06) : 0;
-      const spin = Math.random() < spinChance ? (Math.random() < 0.5 ? -1 : 1) * (0.35 + Math.random() * 0.5) : 0;
-      addPlatform(-i * SPACING, genTypes(i, level), i === 0 ? 0 : Math.random() * TAU, spin, false);
+      const spin = i > 1 && Math.random() < cfg.spin
+        ? (Math.random() < 0.5 ? -1 : 1) * cfg.spinSpeed * (0.8 + Math.random() * 0.4) : 0;
+      const rot = i === 0 ? 0 : Math.random() * TAU;
+      const protect = spin ? new Set() : segmentsUnderGaps(prev, rot);
+      addPlatform(-i * SPACING, genTypes(i, cfg, count, protect), rot, spin, false);
+      prev = platforms[platforms.length - 1];
     }
     addPlatform(-count * SPACING, new Array(SEGMENTS).fill(SAFE), 0, 0, true);
 
@@ -686,7 +722,7 @@
     window.ballCrash = {
       get state() { return { state, level, score, streak, fire, fuel, nextIdx, total: platforms.length, ballY: ball.y, towerRot }; },
       setRot(r) { towerRot = r; },
-      platform(i) { const p = platforms[i]; return p && { types: p.types, rot: platformRot(p), finish: p.finish, smashed: p.smashed }; },
+      platform(i) { const p = platforms[i]; return p && { types: p.types, rot: platformRot(p), baseRot: p.baseRot, spin: p.spin, finish: p.finish, smashed: p.smashed }; },
       setLevel(n) { level = n; buildLevel(); },
     };
   }
